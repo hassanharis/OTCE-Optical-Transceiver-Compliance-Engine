@@ -9,6 +9,7 @@ import pandas as pd
 import streamlit as st
 
 import crosswalk
+import report
 import standards
 from modes import MODES_FILE, flatten, mode_label, read_modes
 
@@ -70,6 +71,53 @@ def drop_empty_columns(frame: pd.DataFrame) -> pd.DataFrame:
     return frame.loc[:, ~empty.all()]
 
 
+SECTION_NOTES = {
+    standards.COMPARISON: "The mode and at least one standard both state a value for the concept, "
+    "so the two can be read against each other.",
+    standards.ENRICHMENT: "The standard states a value for a concept the datasheet is silent on.",
+}
+MODE_ONLY_COLUMNS = ["concept", "SI unit", "mode parameter", "mode value"]
+
+
+def render_values(
+    frame: pd.DataFrame,
+    detail: pd.DataFrame,
+    chosen_standards: list[str],
+    layout: str,
+    selection: dict,
+) -> list[pd.DataFrame]:
+    """Draw one group of concepts, as a single table or one table per standard. Returns what to export."""
+    if frame.empty:
+        st.caption("No concept falls in this group for this mode.")
+        return []
+
+    if layout != "One standard at a time":
+        table = drop_empty_columns(frame)
+        st.dataframe(table, width="stretch", hide_index=True)
+        return [table]
+
+    exports = []
+    for standard in chosen_standards:
+        standard_frame = standards.by_standard(frame, detail, standard)
+        if standard_frame.empty:
+            continue
+        st.markdown(
+            f"**{standard}** — {standards.selection_label(standard, selection.get(standard))} "
+            f"— {len(standard_frame)} parameters"
+        )
+        st.dataframe(
+            standard_frame,
+            width="stretch",
+            hide_index=True,
+            column_config={standard: st.column_config.Column(f"{standard} value")},
+        )
+        exports.append(standard_frame.rename(columns={standard: "standard value"}).assign(standard=standard))
+
+    if not exports:
+        st.caption("No mapped parameter of the selected standards falls in this group.")
+    return exports
+
+
 def read_pick(selection: dict, standard: str, scope: str | None) -> standards.Match | None:
     """SFF-8024 holds one record per scope; every other standard holds a single record."""
     chosen = selection.get(standard)
@@ -95,7 +143,7 @@ def load_standard_docs(root: str, index: dict) -> tuple[dict, dict]:
 
 st.set_page_config(page_title="Mode Parameters", page_icon="", layout="wide")
 st.title("Mode parameters")
-st.caption(f"Reads only `{MODES_FILE}` from each run folder.")
+st.caption(f"Every table is built from `{MODES_FILE}`; the exported report also reads the run's specs and meta.")
 
 runs_dir = st.sidebar.text_input("Runs folder", value=str(DEFAULT_RUNS_DIR))
 runs = list_runs(runs_dir)
@@ -329,25 +377,26 @@ with values_tab:
         key="values_layout",
     )
 
-    left, middle, right = st.columns(3)
+    left, right = st.columns(2)
     include_weak = left.toggle(
         "Accept identifier-only matches",
         value=False,
         help="An ID alone can collide across registries, so by default a record must also be "
         "confirmed by name or by an explicit standard claim.",
     )
-    only_shared = middle.toggle("Only rows where the mode and a standard both have a value", value=False)
     expand_all = right.toggle("Expand all modes", value=False)
 
     identity_names = standards.identity_fields()
     st.caption(f"`{run}` — {len(run_modes)} mode(s).")
 
+    picked_records = []
     for position, mode in enumerate(run_modes, start=1):
         label = mode_label(mode, position)
         identity = {name: mode[name] for name in identity_names if mode.get(name) is not None}
         matches = standards.resolve(mode, docs) if identity else {}
         selected = standards.default_selection(matches, include_weak)
         reached = standards.resolved_standards(selected)
+        picked_records.append(selected)  # the pickers below edit this dict in place
 
         with st.expander(
             f"**{label}** — {', '.join(reached) or 'no standard record matched'}",
@@ -406,9 +455,7 @@ with values_tab:
                 st.dataframe(drop_empty_columns(pd.DataFrame(rows)), width="stretch", hide_index=True)
 
             wide, detail = standards.compare_mode(mode, taxonomy, docs, selected, chosen_standards)
-            view = wide
-            if only_shared and chosen_standards:
-                view = wide[wide["mode value"].notna() & wide[chosen_standards].notna().any(axis=1)]
+            sections = standards.split_values(wide, chosen_standards)
 
             values_pane, provenance_pane = st.tabs(
                 ["Mapped parameter values", "Where each standard value came from"]
@@ -416,47 +463,39 @@ with values_tab:
 
             with values_pane:
                 left, middle, right = st.columns(3)
-                left.metric("Concepts with a value", len(view))
-                middle.metric("From the mode", int(view["mode value"].notna().sum()))
-                right.metric(
-                    "From a standard",
-                    int(view[chosen_standards].notna().any(axis=1).sum()) if chosen_standards else 0,
-                )
+                left.metric("Compared", len(sections[standards.COMPARISON]))
+                middle.metric("Added by a standard", len(sections[standards.ENRICHMENT]))
+                right.metric("Datasheet only", len(sections[standards.MODE_ONLY]))
 
-                if layout == "One standard at a time":
-                    tidy = []
-                    for standard in chosen_standards:
-                        st.markdown(f"#### {standard}")
-                        standard_frame = standards.by_standard(view, detail, standard)
-                        if standard_frame.empty:
-                            st.caption("No mapped parameter of this standard has a value for this mode.")
-                            continue
+                exports = []
+                for section, explanation in SECTION_NOTES.items():
+                    st.markdown(f"#### {section.capitalize()}")
+                    st.caption(explanation)
+                    for part in render_values(
+                        sections[section], detail, chosen_standards, layout, selected
+                    ):
+                        exports.append(part.assign(section=section))
 
-                        st.caption(
-                            f"{standards.selection_label(standard, selected.get(standard))} "
-                            f"— {len(standard_frame)} parameters"
-                        )
+                unmatched = sections[standards.MODE_ONLY]
+                if not unmatched.empty:
+                    with st.expander(
+                        f"Only in the datasheet — {len(unmatched)} concept(s) no selected standard "
+                        "gives a value for"
+                    ):
                         st.dataframe(
-                            standard_frame,
+                            drop_empty_columns(unmatched[MODE_ONLY_COLUMNS]),
                             width="stretch",
                             hide_index=True,
-                            column_config={standard: st.column_config.Column(f"{standard} value")},
-                        )
-                        tidy.append(
-                            standard_frame.rename(columns={standard: "standard value"}).assign(standard=standard)
                         )
 
-                    download = pd.concat(tidy, ignore_index=True) if tidy else drop_empty_columns(view)
-                else:
-                    download = drop_empty_columns(view)
-                    st.dataframe(download, width="stretch", hide_index=True)
-
+                download = pd.concat(exports, ignore_index=True) if exports else pd.DataFrame()
                 st.download_button(
                     "Download values (CSV)",
                     data=download.to_csv(index=False).encode("utf-8"),
                     file_name=f"{run}_{label}_standard_values.csv".replace(" ", "_"),
                     mime="text/csv",
                     key=f"download_values_{position}",
+                    disabled=download.empty,
                 )
 
             with provenance_pane:
@@ -466,3 +505,31 @@ with values_tab:
                     "bandwidths and min/max orientation differ between standards, so treat the columns as "
                     "side-by-side evidence rather than directly comparable numbers."
                 )
+
+    st.divider()
+    st.subheader("Run report")
+    st.caption(
+        "One self-contained HTML file covering the whole run: module specifications, every mode's "
+        "parameters, and the standard records and values resolved above. The records shown here, "
+        "including any you picked by hand, are the ones the report is built from."
+    )
+    st.download_button(
+        "Download run report (HTML)",
+        data=report.build(
+            run,
+            runs_dir,
+            run_modes,
+            picked_records,
+            taxonomy,
+            docs,
+            chosen_standards,
+            crosswalk_path=crosswalk_path,
+            standards_root=standards_root,
+            include_weak=include_weak,
+            field_order=tuple(canonical_order),
+            descriptions=descriptions,
+        ).encode("utf-8"),
+        file_name=f"{run}_report.html",
+        mime="text/html",
+        key=f"download_report_{run}",
+    )

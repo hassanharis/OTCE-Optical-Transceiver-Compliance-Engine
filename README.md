@@ -2,9 +2,11 @@
 
 A Streamlit app that shows the per-mode parameters extracted into `modes.json`.
 
-It reads **only** `modes.json` from each run folder under `C:\Haris\Final\runs`. The other
-artifacts in a run (`specs.json`, `content.md`, `raw_llm.json`, `mode_atoms.json`, `meta.json`)
-are never opened.
+Every table in the app is built from **only** `modes.json` in each run folder under
+`C:\Haris\Final\runs`. The other artifacts in a run are opened in one place and one place only:
+the exported run report reads `specs.json`, `mode_atoms.json` and `meta.json` for its module
+specification, provenance and multi-valued sections. `content.md`, `parsed.json` and
+`raw_llm.json` are never opened.
 
 ## Run
 
@@ -25,6 +27,7 @@ beside the mode's.
 | `modes.py` | Reading `modes.json` |
 | `crosswalk.py` | Routing parameter names through the taxonomy |
 | `standards.py` | Locating standard records by identity and reading their values |
+| `report.py` | The exported HTML run report: one template, filled from any run |
 
 ## What it shows
 
@@ -94,11 +97,17 @@ How each standard is joined and read:
 | SFF-8024 | host/media interface ID or name, against the Table 4-5 and 4-6/4-7 registries | the matched registry row |
 | OpenZR+ | media interface name or SFF-8024 ID, against `identity[]` | the identity record, plus `optical_parameters` resolved on the mode's axes (payload rate, modulation, symbol rate, power profile, add/drop, grid) |
 | OpenROADM | media interface ID or operational-mode ID, against the xponder-pluggable modes | the matched operational-mode record, plus shared grid parameters |
-| OIF-400ZR | media interface ID, against the `application_code` axis | each specification's `base` plus the overrides selected by that application code |
+| OIF-400ZR | `standards_code` or media interface ID, against the `application_code` axis | each specification's `base` plus the overrides selected by that application code |
 
 Identifiers are spelled differently in every source — `0x64` in modes.json, `64` in SFF-8024
 and OpenROADM, `46h` in OpenZR+ — so matching is done on parsed integers, and names are
 compared with punctuation and case folded away.
+
+The same identifier also lands in different *fields* depending on how the datasheet stated it.
+One datasheet gives an OIF application code its own column, which the extraction puts in
+`media_interface_id_hex`; another states it in prose ("supports both the amplified (Application
+Code 0x01) and the un-amplified (Application Code 0x02) use cases"), which lands in
+`standards_code`. Both fields are therefore searched for an application code.
 
 ### Why a matching ID is not enough
 
@@ -113,24 +122,58 @@ identifier-only matches**. Where several records legitimately match — `0x64` m
 `OR-W-400G-oFEC-118Gbd` and its `_type2` variant — each one is a dropdown so you choose which
 record the values are read from.
 
-The values themselves come in two layouts:
+The mapped values are split by which side of the comparison actually stated something, because
+the three cases answer different questions:
+
+- **Comparison** — the mode and at least one standard both give a value. These are the only rows
+  that say anything about conformance.
+- **Enrichment** — the standard gives a value the datasheet is silent on: what the mode inherits
+  by claiming that record.
+- **Only in the datasheet** — collapsed below the other two. The crosswalk maps the concept, but
+  the matched record gives no value for it, so there is nothing to compare against.
+
+Each group comes in two layouts:
 
 - **All standards side by side** — one row per concept, one column per standard. Best for
   spotting where the standards disagree, at the cost of empty cells where a standard says
   nothing about a concept.
-- **One standard at a time** — a section per standard, listing only what that standard actually
-  defines for this mode, grouped by dimension, with the mode's value beside it and the source
-  term and unit alongside. The heading names the record the values were read from. Columns that
-  would repeat the same value on every row, such as a single shared reference, are dropped.
+- **One standard at a time** — a table per standard, listing only what that standard actually
+  defines for this mode, with the mode's value beside it and the source term and unit alongside.
+  The heading names the record the values were read from. Columns that would repeat the same
+  value on every row, such as a single shared reference, are dropped.
 
-Both layouts honour the "only rows where the mode and a standard both have a value" filter, and
-the download button exports whichever layout is on screen.
+The download button exports whichever layout is on screen, with a `section` column marking which
+group each row came from.
 
 Values are shown as each standard publishes them, including the bound (`min 80 km`,
 `-10 … -6 dBm`, `expected 100 GHz`) and its unit. They are **not** normalised into a common
 reference: reference points, measurement bandwidths and min/max orientation differ between
 standards. The "Where each standard value came from" panel gives the term, unit, measurement
 bandwidth and source clause behind every cell.
+
+## Run report
+
+At the bottom of the **Standards values** tab, **Download run report (HTML)** exports the whole
+run as one self-contained file: no external CSS, fonts or scripts, so it can be mailed, archived
+or printed as it is. The template lives in `report.py` and never changes per run; only its
+content does.
+
+| Section | Source | Contents |
+| --- | --- | --- |
+| Header and tally | `specs.json`, resolution results | vendor, model, form factor, band, and counts of modes, standards resolved, concepts compared and concepts added by a standard |
+| General specifications | `specs.json` minus `mode_atoms.json`'s multi-valued fields | what the datasheet states once for the whole part, so nothing that varies per mode is repeated here |
+| Operating modes | `modes.json` | one row per mode, one column per parameter any mode carries, ordered by `MODE_FIELDS`, with the schema description as a column tooltip |
+| Multi-valued fields | `mode_atoms.json` | the values the modes were synthesized from, which is why a mode says what it says |
+| Standards values, mode by mode | the standards datasets | per mode: identity parameters, the record matched in each standard with the evidence for it, then the comparison, enrichment and datasheet-only groups, and a collapsible provenance table of term, unit, measurement bandwidth and clause behind every value |
+| Footer | `meta.json` | run, extraction timestamp and model, whether identifier-only matches were accepted, the crosswalk and standards paths, and when the report was generated |
+
+The report is built from the records **currently** selected in the tab, including any you picked
+by hand from a dropdown, and it honours the standards multiselect and the identifier-only toggle.
+A section whose source file a run does not have is left out rather than rendered empty, so sparse
+runs produce a short report instead of a broken one.
+
+Field names become headings with their unit lifted out: `rx_osnr_tolerance_db_max` reads as
+*RX OSNR Tolerance Max (dB)*, `cd_tolerance_ps_nm` as *CD Tolerance (ps/nm)*.
 
 ### A note on the crosswalk file
 

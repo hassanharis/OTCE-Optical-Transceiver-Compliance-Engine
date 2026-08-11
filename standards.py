@@ -668,8 +668,6 @@ def compare_mode(
             continue
         row = {
             "concept": concept["canonical_id"],
-            "concept label": concept.get("pref_label"),
-            "dimension": concept.get("dimension"),
             "SI unit": concept.get("si_unit"),
             "mode parameter": ", ".join(present) or None,
             "mode value": mode_value,
@@ -677,29 +675,50 @@ def compare_mode(
         row.update({standard: values.get(standard) for standard in standards})
         rows.append(row)
 
-    columns = ["concept", "concept label", "dimension", "SI unit", "mode parameter", "mode value", *standards]
+    columns = ["concept", "SI unit", "mode parameter", "mode value", *standards]
     return pd.DataFrame(rows, columns=columns), pd.DataFrame(details)
+
+
+COMPARISON = "comparison"
+ENRICHMENT = "enrichment"
+MODE_ONLY = "datasheet only"
+
+
+def split_values(wide, standards: list[str]) -> dict[str, Any]:
+    """Group the mapped concepts by which side of the comparison actually stated a value.
+
+    A concept only carries a claim about conformance when both sides answered it; the rest
+    is either the standard filling in what the datasheet left out, or the reverse.
+    """
+    import pandas as pd
+
+    from_mode = wide["mode value"].notna()
+    from_standard = (
+        wide[standards].notna().any(axis=1) if standards else pd.Series(False, index=wide.index, dtype=bool)
+    )
+    return {
+        COMPARISON: wide[from_mode & from_standard],
+        ENRICHMENT: wide[~from_mode & from_standard],
+        MODE_ONLY: wide[from_mode & ~from_standard],
+    }
 
 
 def by_standard(wide, detail, standard: str):
     """One standard on its own: only what it defines, beside the mode's value for the same concept."""
     import pandas as pd
 
-    if detail.empty:
+    if detail.empty or wide.empty:
         return pd.DataFrame()
     rows = detail[(detail["standard"] == standard) & detail["concept"].isin(set(wide["concept"]))]
     if rows.empty:
         return pd.DataFrame()
 
-    labels = dict(zip(wide["concept"], wide["concept label"]))
-    dimensions = dict(zip(wide["concept"], wide["dimension"]))
     parameters = dict(zip(wide["concept"], wide["mode parameter"]))
     mode_values = dict(zip(wide["concept"], wide["mode value"]))
 
     frame = pd.DataFrame(
         {
-            "parameter": [labels.get(key) or key for key in rows["concept"]],
-            "dimension": [dimensions.get(key) for key in rows["concept"]],
+            "parameter": rows["concept"].tolist(),
             "mode parameter": [parameters.get(key) for key in rows["concept"]],
             "mode value": [mode_values.get(key) for key in rows["concept"]],
             standard: rows["value"].tolist(),
@@ -709,7 +728,6 @@ def by_standard(wide, detail, standard: str):
             "reference": rows["reference"].tolist(),
         }
     )
-    frame = frame.sort_values(["dimension", "parameter"], na_position="last", ignore_index=True)
     if frame["reference"].nunique(dropna=True) <= 1:
         # A single shared reference is just the matched record, which the caller already names.
         frame = frame.drop(columns="reference")

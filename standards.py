@@ -688,6 +688,18 @@ def by_standard(wide, detail, standard: str):
     return frame.dropna(axis="columns", how="all")
 
 
+def resolved_standards(selection: dict[str, Any]) -> list[str]:
+    """Standards whose selection actually landed on a record."""
+    names = []
+    for standard, chosen in selection.items():
+        if isinstance(chosen, dict):
+            if any(chosen.values()):
+                names.append(standard)
+        elif chosen is not None:
+            names.append(standard)
+    return names
+
+
 def selection_label(standard: str, chosen: Any) -> str:
     if chosen is None:
         return "no record"

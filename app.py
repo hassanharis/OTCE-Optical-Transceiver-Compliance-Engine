@@ -62,6 +62,19 @@ def mtime_of(runs_dir: str, run: str) -> float:
     return (Path(runs_dir) / run / MODES_FILE).stat().st_mtime
 
 
+def read_pick(selection: dict, standard: str, scope: str | None) -> standards.Match | None:
+    """SFF-8024 holds one record per scope; every other standard holds a single record."""
+    chosen = selection.get(standard)
+    return chosen.get(scope) if isinstance(chosen, dict) else chosen
+
+
+def write_pick(selection: dict, standard: str, scope: str | None, match: standards.Match) -> None:
+    if isinstance(selection.get(standard), dict):
+        selection[standard][scope] = match
+    else:
+        selection[standard] = match
+
+
 @st.cache_data(show_spinner=False)
 def load_taxonomy(crosswalk_path: str, _mtime: float) -> tuple[dict, bool]:
     return crosswalk.load_crosswalk(crosswalk_path)
@@ -92,7 +105,8 @@ if st.sidebar.button("Reload from disk", width="stretch"):
 
 canonical_order, descriptions = _load_schema_hints(Path(runs_dir))
 compare_runs = st.sidebar.toggle("Compare all runs", value=False)
-selected_runs = runs if compare_runs else [st.sidebar.selectbox("Run", runs)]
+run = st.sidebar.selectbox("Run", runs, help="Also selects the run shown in Standards values.")
+selected_runs = runs if compare_runs else [run]
 
 frames = {run: load_parameters(runs_dir, run, mtime_of(runs_dir, run), tuple(canonical_order)) for run in selected_runs}
 
@@ -289,132 +303,158 @@ with values_tab:
         st.error(f"No standard datasets could be loaded from {standards_root}.")
         st.stop()
 
-    run = st.selectbox("Run", runs, key="values_run")
     run_modes = read_modes(Path(runs_dir) / run / MODES_FILE)
 
     if not run_modes:
         st.info("This run has no modes recorded.")
         st.stop()
 
-    labels = [mode_label(mode, index) for index, mode in enumerate(run_modes, start=1)]
-    chosen_label = st.selectbox("Mode", labels, key="values_mode")
-    mode = run_modes[labels.index(chosen_label)]
-
-    identity_names = standards.identity_fields()
-    identity = {name: mode[name] for name in identity_names if mode.get(name) is not None}
-
-    st.subheader("Identity parameters")
-    if not identity:
-        st.warning(
-            "This mode carries none of the STANDARDS_IDENTITY_FIELDS "
-            f"({', '.join(identity_names)}), so it cannot be located in any standard."
-        )
-        st.stop()
-
-    st.dataframe(
-        pd.DataFrame({"parameter": list(identity), "value": [str(flatten(v)) for v in identity.values()]}),
-        width="stretch",
-        hide_index=True,
-    )
-
-    include_weak = st.toggle(
-        "Accept identifier-only matches",
-        value=False,
-        help="An ID alone can collide across registries, so by default a record must also be "
-        "confirmed by name or by an explicit standard claim.",
-    )
-
-    matches = standards.resolve(mode, docs)
-    selected = standards.default_selection(matches, include_weak)
-
-    st.subheader("Matched records")
-    for standard in docs:
-        found = standards.usable_matches(matches.get(standard, []), None, include_weak)
-        rejected = [m for m in matches.get(standard, []) if m not in found]
-
-        if not found:
-            note = f" ({len(rejected)} identifier-only candidate(s) rejected)" if rejected else ""
-            st.markdown(f"**{standard}** — no record matched{note}")
-            continue
-
-        scopes = standards.SFF_SCOPES if standard == "SFF-8024" else (None,)
-        for scope in scopes:
-            options = [m for m in found if scope is None or m.scope == scope]
-            if not options:
-                continue
-            title = f"**{standard}**" + (f" — {scope}" if scope else "")
-            st.markdown(title)
-            picked = st.selectbox(
-                "Record",
-                options,
-                format_func=lambda m: f"{m.label}  [{m.confidence}]",
-                key=f"record_{standard}_{scope}",
-                label_visibility="collapsed",
-            )
-            if standard == "SFF-8024":
-                selected[standard][scope] = picked
-            else:
-                selected[standard] = picked
-            st.caption(" · ".join(picked.evidence))
-
     chosen_standards = st.multiselect(
         "Standards", options=list(docs), default=list(docs), key="values_standards"
     )
-    wide, detail = standards.compare_mode(mode, taxonomy, docs, selected, chosen_standards)
-
-    st.subheader("Mapped parameter values")
-    only_shared = st.toggle("Only rows where the mode and a standard both have a value", value=False)
-    view = wide
-    if only_shared and chosen_standards:
-        view = wide[wide["mode value"].notna() & wide[chosen_standards].notna().any(axis=1)]
-
-    left, middle, right = st.columns(3)
-    left.metric("Concepts with a value", len(view))
-    middle.metric("From the mode", int(view["mode value"].notna().sum()))
-    right.metric("From a standard", int(view[chosen_standards].notna().any(axis=1).sum()) if chosen_standards else 0)
-
     layout = st.segmented_control(
         "View", ["All standards side by side", "One standard at a time"],
         default="All standards side by side",
         key="values_layout",
     )
 
-    if layout == "One standard at a time":
-        tidy = []
-        for standard in chosen_standards:
-            frame = standards.by_standard(view, detail, standard)
-            if frame.empty:
-                st.markdown(f"#### {standard}")
-                st.caption("No mapped parameter of this standard has a value for this mode.")
+    left, middle, right = st.columns(3)
+    include_weak = left.toggle(
+        "Accept identifier-only matches",
+        value=False,
+        help="An ID alone can collide across registries, so by default a record must also be "
+        "confirmed by name or by an explicit standard claim.",
+    )
+    only_shared = middle.toggle("Only rows where the mode and a standard both have a value", value=False)
+    expand_all = right.toggle("Expand all modes", value=False)
+
+    identity_names = standards.identity_fields()
+    st.caption(f"`{run}` — {len(run_modes)} mode(s).")
+
+    for position, mode in enumerate(run_modes, start=1):
+        label = mode_label(mode, position)
+        identity = {name: mode[name] for name in identity_names if mode.get(name) is not None}
+        matches = standards.resolve(mode, docs) if identity else {}
+        selected = standards.default_selection(matches, include_weak)
+        reached = standards.resolved_standards(selected)
+
+        with st.expander(
+            f"**{label}** — {', '.join(reached) or 'no standard record matched'}",
+            expanded=expand_all,
+            icon=":material/check_circle:" if reached else ":material/error:",
+        ):
+            if not identity:
+                st.warning(
+                    "This mode carries none of the STANDARDS_IDENTITY_FIELDS "
+                    f"({', '.join(identity_names)}), so it cannot be located in any standard."
+                )
                 continue
 
-            st.markdown(f"#### {standard}")
-            st.caption(f"{standards.selection_label(standard, selected.get(standard))} — {len(frame)} parameters")
+            st.markdown("**Identity parameters**")
             st.dataframe(
-                frame,
+                pd.DataFrame(
+                    {"parameter": list(identity), "value": [str(flatten(v)) for v in identity.values()]}
+                ),
                 width="stretch",
                 hide_index=True,
-                column_config={standard: st.column_config.Column(f"{standard} value")},
             )
-            tidy.append(frame.rename(columns={standard: "standard value"}).assign(standard=standard))
 
-        download = pd.concat(tidy, ignore_index=True) if tidy else view
-    else:
-        st.dataframe(view, width="stretch", hide_index=True)
-        download = view
+            st.markdown("**Matched records**")
+            resolution = st.container()  # filled once the pickers below have settled the selection
+            rows = []
+            for standard in docs:
+                for scope in (standards.SFF_SCOPES if standard == "SFF-8024" else (None,)):
+                    candidates = [m for m in matches.get(standard, []) if scope is None or m.scope == scope]
+                    options = standards.usable_matches(candidates, None, include_weak)
+                    if len(options) > 1:
+                        write_pick(
+                            selected,
+                            standard,
+                            scope,
+                            st.selectbox(
+                                f"{standard} record" + (f" ({scope})" if scope else ""),
+                                options,
+                                format_func=lambda m: f"{m.label}  [{m.confidence}]",
+                                key=f"record_{run}_{position}_{standard}_{scope}",
+                            ),
+                        )
+                    picked = read_pick(selected, standard, scope)
+                    rows.append(
+                        {
+                            "standard": standard,
+                            "scope": scope or "—",
+                            "record": picked.label if picked else "—",
+                            "confidence": picked.confidence if picked else "no record matched",
+                            "candidates": len(options),
+                            "rejected": len(candidates) - len(options),
+                            "why": " · ".join(picked.evidence) if picked else "",
+                        }
+                    )
 
-    st.download_button(
-        "Download values (CSV)",
-        data=download.to_csv(index=False).encode("utf-8"),
-        file_name=f"{run}_{chosen_label}_standard_values.csv".replace(" ", "_"),
-        mime="text/csv",
-        key="download_values",
-    )
+            with resolution:
+                frame = pd.DataFrame(rows)
+                if not frame["rejected"].any():
+                    frame = frame.drop(columns="rejected")
+                st.dataframe(frame, width="stretch", hide_index=True)
 
-    with st.expander("Where each standard value came from"):
-        st.dataframe(detail, width="stretch", hide_index=True)
-        st.caption(
-            "Values are read from each standard as published. Reference points, measurement "
-            "bandwidths and min/max orientation differ between standards, so treat the columns as "
-            "side-by-side evidence rather than directly comparable numbers."
-        )
+            wide, detail = standards.compare_mode(mode, taxonomy, docs, selected, chosen_standards)
+            view = wide
+            if only_shared and chosen_standards:
+                view = wide[wide["mode value"].notna() & wide[chosen_standards].notna().any(axis=1)]
+
+            values_pane, provenance_pane = st.tabs(
+                ["Mapped parameter values", "Where each standard value came from"]
+            )
+
+            with values_pane:
+                left, middle, right = st.columns(3)
+                left.metric("Concepts with a value", len(view))
+                middle.metric("From the mode", int(view["mode value"].notna().sum()))
+                right.metric(
+                    "From a standard",
+                    int(view[chosen_standards].notna().any(axis=1).sum()) if chosen_standards else 0,
+                )
+
+                if layout == "One standard at a time":
+                    tidy = []
+                    for standard in chosen_standards:
+                        st.markdown(f"#### {standard}")
+                        standard_frame = standards.by_standard(view, detail, standard)
+                        if standard_frame.empty:
+                            st.caption("No mapped parameter of this standard has a value for this mode.")
+                            continue
+
+                        st.caption(
+                            f"{standards.selection_label(standard, selected.get(standard))} "
+                            f"— {len(standard_frame)} parameters"
+                        )
+                        st.dataframe(
+                            standard_frame,
+                            width="stretch",
+                            hide_index=True,
+                            column_config={standard: st.column_config.Column(f"{standard} value")},
+                        )
+                        tidy.append(
+                            standard_frame.rename(columns={standard: "standard value"}).assign(standard=standard)
+                        )
+
+                    download = pd.concat(tidy, ignore_index=True) if tidy else view
+                else:
+                    st.dataframe(view, width="stretch", hide_index=True)
+                    download = view
+
+                st.download_button(
+                    "Download values (CSV)",
+                    data=download.to_csv(index=False).encode("utf-8"),
+                    file_name=f"{run}_{label}_standard_values.csv".replace(" ", "_"),
+                    mime="text/csv",
+                    key=f"download_values_{position}",
+                )
+
+            with provenance_pane:
+                st.dataframe(detail, width="stretch", hide_index=True)
+                st.caption(
+                    "Values are read from each standard as published. Reference points, measurement "
+                    "bandwidths and min/max orientation differ between standards, so treat the columns as "
+                    "side-by-side evidence rather than directly comparable numbers."
+                )

@@ -15,7 +15,16 @@ streamlit run app.py
 
 The **Standards crosswalk** tab additionally reads
 `C:\Haris\Final\Standards\_crosswalk\parameter_taxonomy.crosswalk.json` to map those
-parameters onto their equivalents in other standards.
+parameters onto their equivalents in other standards, and the **Standards values** tab reads
+the standards' own datasets under `C:\Haris\Final\Standards` to show their published values
+beside the mode's.
+
+| File | Purpose |
+| --- | --- |
+| `app.py` | Streamlit UI: the three tabs |
+| `modes.py` | Reading `modes.json` |
+| `crosswalk.py` | Routing parameter names through the taxonomy |
+| `standards.py` | Locating standard records by identity and reading their values |
 
 ## What it shows
 
@@ -67,6 +76,61 @@ Values are deliberately **not** compared across standards. The taxonomy's own
 `reference_point_guard` rule warns that mappings with different reference points or measurement
 bandwidths are not directly comparable without a documented transform, so the app routes names
 and records the caveats (shown as a comparability note under the mapping detail).
+
+## Standards values
+
+The crosswalk tab routes parameter *names*. The **Standards values** tab goes one step further
+and reads the standards' own *values* for a single mode.
+
+The mode's `STANDARDS_IDENTITY_FIELDS` (from `transceiver_models.py`: host and media interface
+names and IDs, `standards_code`, `frame`) say which record of a standard the mode claims to be.
+Once that record is located, every parameter the crosswalk maps for that standard can be read
+out of the standard's own dataset and shown beside the datasheet's value.
+
+How each standard is joined and read:
+
+| Standard | Record located by | Values read from |
+| --- | --- | --- |
+| SFF-8024 | host/media interface ID or name, against the Table 4-5 and 4-6/4-7 registries | the matched registry row |
+| OpenZR+ | media interface name or SFF-8024 ID, against `identity[]` | the identity record, plus `optical_parameters` resolved on the mode's axes (payload rate, modulation, symbol rate, power profile, add/drop, grid) |
+| OpenROADM | media interface ID or operational-mode ID, against the xponder-pluggable modes | the matched operational-mode record, plus shared grid parameters |
+| OIF-400ZR | media interface ID, against the `application_code` axis | each specification's `base` plus the overrides selected by that application code |
+
+Identifiers are spelled differently in every source — `0x64` in modes.json, `64` in SFF-8024
+and OpenROADM, `46h` in OpenZR+ — so matching is done on parsed integers, and names are
+compared with punctuation and case folded away.
+
+### Why a matching ID is not enough
+
+The same number means different things in different registries. A mode whose
+`media_interface_id_hex` is `0x01` because that is its *OIF application code* will also "match"
+SFF-8024 media ID 1, which is `10GBASE-LW` — a completely unrelated interface.
+
+So a record counts as **corroborated** only when a name also matches or the mode explicitly
+claims the standard (via `standards_code` or its label). Uncorroborated records are listed as
+*identifier only* and are excluded from the value table unless you switch on **Accept
+identifier-only matches**. Where several records legitimately match — `0x64` maps to both
+`OR-W-400G-oFEC-118Gbd` and its `_type2` variant — each one is a dropdown so you choose which
+record the values are read from.
+
+The values themselves come in two layouts:
+
+- **All standards side by side** — one row per concept, one column per standard. Best for
+  spotting where the standards disagree, at the cost of empty cells where a standard says
+  nothing about a concept.
+- **One standard at a time** — a section per standard, listing only what that standard actually
+  defines for this mode, grouped by dimension, with the mode's value beside it and the source
+  term and unit alongside. The heading names the record the values were read from. Columns that
+  would repeat the same value on every row, such as a single shared reference, are dropped.
+
+Both layouts honour the "only rows where the mode and a standard both have a value" filter, and
+the download button exports whichever layout is on screen.
+
+Values are shown as each standard publishes them, including the bound (`min 80 km`,
+`-10 … -6 dBm`, `expected 100 GHz`) and its unit. They are **not** normalised into a common
+reference: reference points, measurement bandwidths and min/max orientation differ between
+standards. The "Where each standard value came from" panel gives the term, unit, measurement
+bandwidth and source clause behind every cell.
 
 ### A note on the crosswalk file
 

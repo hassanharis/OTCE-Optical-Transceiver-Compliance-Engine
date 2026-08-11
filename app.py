@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import json
 import sys
 from pathlib import Path
 
@@ -10,9 +9,10 @@ import pandas as pd
 import streamlit as st
 
 import crosswalk
+import standards
+from modes import MODES_FILE, flatten, mode_label, read_modes
 
 DEFAULT_RUNS_DIR = Path(r"C:\Haris\Final\runs")
-MODES_FILE = "modes.json"
 LABEL_KEY = "label"
 
 
@@ -33,22 +33,6 @@ def _load_schema_hints(runs_dir: Path) -> tuple[list[str], dict[str, str]]:
     return list(MODE_FIELDS), descriptions
 
 
-def _flatten(value: object) -> object:
-    if isinstance(value, list):
-        return ", ".join(str(item) for item in value if item is not None) or None
-    if isinstance(value, dict):
-        return json.dumps(value, ensure_ascii=False)
-    return value
-
-
-def _read_modes(path: Path) -> list[dict]:
-    data = json.loads(path.read_text(encoding="utf-8"))
-    modes = data.get("modes", []) if isinstance(data, dict) else data
-    if not isinstance(modes, list):
-        return []
-    return [mode for mode in modes if isinstance(mode, dict)]
-
-
 @st.cache_data(show_spinner=False)
 def list_runs(runs_dir: str) -> list[str]:
     base = Path(runs_dir)
@@ -61,13 +45,12 @@ def list_runs(runs_dir: str) -> list[str]:
 @st.cache_data(show_spinner=False)
 def load_parameters(runs_dir: str, run: str, _mtime: float, canonical: tuple[str, ...]) -> pd.DataFrame:
     """One row per mode, one column per parameter. Nothing outside modes.json is read."""
-    modes = _read_modes(Path(runs_dir) / run / MODES_FILE)
+    modes = read_modes(Path(runs_dir) / run / MODES_FILE)
 
     rows, labels = [], []
     for index, mode in enumerate(modes, start=1):
-        label = mode.get(LABEL_KEY) or f"Mode {index}"
-        labels.append(str(label))
-        rows.append({key: _flatten(value) for key, value in mode.items() if key != LABEL_KEY})
+        labels.append(mode_label(mode, index))
+        rows.append({key: flatten(value) for key, value in mode.items() if key != LABEL_KEY})
 
     frame = pd.DataFrame(rows, index=pd.Index(labels, name="Mode"))
     ordered = [name for name in canonical if name in frame.columns]
@@ -82,6 +65,11 @@ def mtime_of(runs_dir: str, run: str) -> float:
 @st.cache_data(show_spinner=False)
 def load_taxonomy(crosswalk_path: str, _mtime: float) -> tuple[dict, bool]:
     return crosswalk.load_crosswalk(crosswalk_path)
+
+
+@st.cache_resource(show_spinner="Loading standards datasets...")
+def load_standard_docs(root: str, index: dict) -> tuple[dict, dict]:
+    return standards.load_standards(root, index)
 
 
 st.set_page_config(page_title="Mode Parameters", page_icon="", layout="wide")
@@ -125,7 +113,16 @@ hide_empty = st.sidebar.toggle("Hide empty parameters", value=True)
 choices = populated if hide_empty else parameters
 selection = st.sidebar.multiselect("Parameters", options=choices, default=choices)
 
-parameters_tab, crosswalk_tab = st.tabs(["Mode parameters", "Standards crosswalk"])
+crosswalk_path = st.sidebar.text_input("Crosswalk file", value=str(crosswalk.DEFAULT_CROSSWALK))
+taxonomy, repaired = (
+    load_taxonomy(crosswalk_path, Path(crosswalk_path).stat().st_mtime)
+    if Path(crosswalk_path).is_file()
+    else (None, False)
+)
+
+parameters_tab, crosswalk_tab, values_tab = st.tabs(
+    ["Mode parameters", "Standards crosswalk", "Standards values"]
+)
 
 with parameters_tab:
     search = st.text_input("Filter modes", placeholder="Search across mode names and values")
@@ -167,24 +164,21 @@ with parameters_tab:
         st.dataframe(coverage, width="stretch", hide_index=True)
 
 with crosswalk_tab:
-    crosswalk_path = st.text_input("Crosswalk file", value=str(crosswalk.DEFAULT_CROSSWALK))
-
-    if not Path(crosswalk_path).is_file():
+    if taxonomy is None:
         st.error(f"Crosswalk not found: {crosswalk_path}")
         st.stop()
 
-    taxonomy, repaired = load_taxonomy(crosswalk_path, Path(crosswalk_path).stat().st_mtime)
     if repaired:
         st.warning(
             "The crosswalk file is not strictly valid JSON (a trailing comma in `meta.coverage`). "
             "It was parsed with trailing commas removed."
         )
 
-    standards = crosswalk.standard_ids(taxonomy)
+    standard_list = crosswalk.standard_ids(taxonomy)
     names = crosswalk.standard_names(taxonomy)
     st.caption(
         "Each parameter is routed through its canonical concept to the term used by every other standard. "
-        f"Standards indexed: {', '.join(standards)}."
+        f"Standards indexed: {', '.join(standard_list)}."
     )
 
     scope_all = st.toggle("Show every concept in the taxonomy", value=False)
@@ -193,8 +187,8 @@ with crosswalk_tab:
     by_parameter, unmapped = crosswalk.route_parameters(taxonomy, selection, with_units)
     routed = crosswalk.route_concepts(taxonomy, with_units) if scope_all else by_parameter
 
-    chosen_standards = st.multiselect("Standards", options=standards, default=standards)
-    fixed = [column for column in routed.columns if column not in standards]
+    chosen_standards = st.multiselect("Standards", options=standard_list, default=standard_list)
+    fixed = [column for column in routed.columns if column not in standard_list]
     routed = routed[fixed + chosen_standards]
 
     reached = int(routed[chosen_standards].notna().any(axis=1).sum()) if chosen_standards else 0
@@ -246,8 +240,9 @@ with crosswalk_tab:
             "role of this parameter": role,
             "acronyms": ", ".join(concept.get("acronyms", [])) or None,
         }
+        known = {key: value for key, value in facts.items() if value is not None}
         st.dataframe(
-            pd.DataFrame({"property": list(facts), "value": list(facts.values())}).dropna(),
+            pd.DataFrame({"property": list(known), "value": [str(value) for value in known.values()]}),
             width="stretch",
             hide_index=True,
         )
@@ -274,3 +269,152 @@ with crosswalk_tab:
             with st.expander(f"{concept.get('pref_label')} — {concept['canonical_id']}"):
                 st.caption(f"Datasheet parameters: {fields or 'none'}")
                 st.dataframe(crosswalk.mapping_details(concept), width="stretch", hide_index=True)
+
+with values_tab:
+    if taxonomy is None:
+        st.error(f"Crosswalk not found: {crosswalk_path}")
+        st.stop()
+
+    st.caption(
+        "Identity parameters say which record of a standard a mode claims to be. Once that record "
+        "is located, every parameter the crosswalk maps can be read from the standard's own dataset."
+    )
+
+    standards_root = st.text_input("Standards folder", value=str(standards.STANDARDS_ROOT))
+    docs, problems = load_standard_docs(standards_root, taxonomy["standards_index"])
+    for standard, problem in problems.items():
+        st.warning(f"{standard}: {problem}")
+
+    if not docs:
+        st.error(f"No standard datasets could be loaded from {standards_root}.")
+        st.stop()
+
+    run = st.selectbox("Run", runs, key="values_run")
+    run_modes = read_modes(Path(runs_dir) / run / MODES_FILE)
+
+    if not run_modes:
+        st.info("This run has no modes recorded.")
+        st.stop()
+
+    labels = [mode_label(mode, index) for index, mode in enumerate(run_modes, start=1)]
+    chosen_label = st.selectbox("Mode", labels, key="values_mode")
+    mode = run_modes[labels.index(chosen_label)]
+
+    identity_names = standards.identity_fields()
+    identity = {name: mode[name] for name in identity_names if mode.get(name) is not None}
+
+    st.subheader("Identity parameters")
+    if not identity:
+        st.warning(
+            "This mode carries none of the STANDARDS_IDENTITY_FIELDS "
+            f"({', '.join(identity_names)}), so it cannot be located in any standard."
+        )
+        st.stop()
+
+    st.dataframe(
+        pd.DataFrame({"parameter": list(identity), "value": [str(flatten(v)) for v in identity.values()]}),
+        width="stretch",
+        hide_index=True,
+    )
+
+    include_weak = st.toggle(
+        "Accept identifier-only matches",
+        value=False,
+        help="An ID alone can collide across registries, so by default a record must also be "
+        "confirmed by name or by an explicit standard claim.",
+    )
+
+    matches = standards.resolve(mode, docs)
+    selected = standards.default_selection(matches, include_weak)
+
+    st.subheader("Matched records")
+    for standard in docs:
+        found = standards.usable_matches(matches.get(standard, []), None, include_weak)
+        rejected = [m for m in matches.get(standard, []) if m not in found]
+
+        if not found:
+            note = f" ({len(rejected)} identifier-only candidate(s) rejected)" if rejected else ""
+            st.markdown(f"**{standard}** — no record matched{note}")
+            continue
+
+        scopes = standards.SFF_SCOPES if standard == "SFF-8024" else (None,)
+        for scope in scopes:
+            options = [m for m in found if scope is None or m.scope == scope]
+            if not options:
+                continue
+            title = f"**{standard}**" + (f" — {scope}" if scope else "")
+            st.markdown(title)
+            picked = st.selectbox(
+                "Record",
+                options,
+                format_func=lambda m: f"{m.label}  [{m.confidence}]",
+                key=f"record_{standard}_{scope}",
+                label_visibility="collapsed",
+            )
+            if standard == "SFF-8024":
+                selected[standard][scope] = picked
+            else:
+                selected[standard] = picked
+            st.caption(" · ".join(picked.evidence))
+
+    chosen_standards = st.multiselect(
+        "Standards", options=list(docs), default=list(docs), key="values_standards"
+    )
+    wide, detail = standards.compare_mode(mode, taxonomy, docs, selected, chosen_standards)
+
+    st.subheader("Mapped parameter values")
+    only_shared = st.toggle("Only rows where the mode and a standard both have a value", value=False)
+    view = wide
+    if only_shared and chosen_standards:
+        view = wide[wide["mode value"].notna() & wide[chosen_standards].notna().any(axis=1)]
+
+    left, middle, right = st.columns(3)
+    left.metric("Concepts with a value", len(view))
+    middle.metric("From the mode", int(view["mode value"].notna().sum()))
+    right.metric("From a standard", int(view[chosen_standards].notna().any(axis=1).sum()) if chosen_standards else 0)
+
+    layout = st.segmented_control(
+        "View", ["All standards side by side", "One standard at a time"],
+        default="All standards side by side",
+        key="values_layout",
+    )
+
+    if layout == "One standard at a time":
+        tidy = []
+        for standard in chosen_standards:
+            frame = standards.by_standard(view, detail, standard)
+            if frame.empty:
+                st.markdown(f"#### {standard}")
+                st.caption("No mapped parameter of this standard has a value for this mode.")
+                continue
+
+            st.markdown(f"#### {standard}")
+            st.caption(f"{standards.selection_label(standard, selected.get(standard))} — {len(frame)} parameters")
+            st.dataframe(
+                frame,
+                width="stretch",
+                hide_index=True,
+                column_config={standard: st.column_config.Column(f"{standard} value")},
+            )
+            tidy.append(frame.rename(columns={standard: "standard value"}).assign(standard=standard))
+
+        download = pd.concat(tidy, ignore_index=True) if tidy else view
+    else:
+        st.dataframe(view, width="stretch", hide_index=True)
+        download = view
+
+    st.download_button(
+        "Download values (CSV)",
+        data=download.to_csv(index=False).encode("utf-8"),
+        file_name=f"{run}_{chosen_label}_standard_values.csv".replace(" ", "_"),
+        mime="text/csv",
+        key="download_values",
+    )
+
+    with st.expander("Where each standard value came from"):
+        st.dataframe(detail, width="stretch", hide_index=True)
+        st.caption(
+            "Values are read from each standard as published. Reference points, measurement "
+            "bandwidths and min/max orientation differ between standards, so treat the columns as "
+            "side-by-side evidence rather than directly comparable numbers."
+        )

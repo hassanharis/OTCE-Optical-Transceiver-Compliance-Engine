@@ -42,12 +42,16 @@ def standard_names(data: dict[str, Any]) -> dict[str, str]:
     return {key: value.get("name", key) for key, value in data.get("standards_index", {}).items()}
 
 
-def field_index(data: dict[str, Any]) -> dict[str, tuple[dict[str, Any], str | None]]:
-    """Map each datasheet field to its concept and the role it plays in that concept."""
-    index: dict[str, tuple[dict[str, Any], str | None]] = {}
+def field_index(data: dict[str, Any]) -> dict[str, list[tuple[dict[str, Any], str | None]]]:
+    """Map each datasheet field to every concept claiming it, with the role it plays there.
+
+    More than one concept may claim the same field; keeping them all stops a later concept
+    from silently hiding an earlier one's route to a standard.
+    """
+    index: dict[str, list[tuple[dict[str, Any], str | None]]] = {}
     for concept in data["concepts"]:
         for entry in concept.get("transceiver_specs_fields", []):
-            index[entry["field"]] = (concept, entry.get("role"))
+            index.setdefault(entry["field"], []).append((concept, entry.get("role")))
     return index
 
 
@@ -73,21 +77,21 @@ def route_parameters(
 
     rows, unmapped = [], []
     for name in parameters:
-        match = index.get(name)
-        if match is None:
+        claims = index.get(name)
+        if not claims:
             unmapped.append(name)
             continue
-        concept, role = match
-        row = {
-            "parameter": name,
-            "role": role,
-            "concept": concept["canonical_id"],
-            "concept label": concept.get("pref_label"),
-            "dimension": concept.get("dimension"),
-            "SI unit": concept.get("si_unit"),
-        }
-        row.update({standard: _terms(concept, standard, with_units) for standard in standards})
-        rows.append(row)
+        for concept, role in claims:
+            row = {
+                "parameter": name,
+                "role": role,
+                "concept": concept["canonical_id"],
+                "concept label": concept.get("pref_label"),
+                "dimension": concept.get("dimension"),
+                "SI unit": concept.get("si_unit"),
+            }
+            row.update({standard: _terms(concept, standard, with_units) for standard in standards})
+            rows.append(row)
 
     columns = ["parameter", "role", "concept", "concept label", "dimension", "SI unit", *standards]
     return pd.DataFrame(rows, columns=columns), unmapped

@@ -258,20 +258,41 @@ def _match_openroadm(mode: dict[str, Any], doc: dict[str, Any]) -> list[Match]:
     return matches
 
 
+OIF_CODE_FIELDS = ("media_interface_id_hex", "standards_code")
+
+
+def _claimed_codes(mode: dict[str, Any]) -> dict[int, list[str]]:
+    """Application codes the mode states, as integers, each with the fields that stated it.
+
+    A datasheet puts its application code wherever its own layout suggests: an app-code column
+    is extracted into media_interface_id_hex, while prose such as 'Application Code 0x01' is
+    extracted into standards_code. Either field can also hold something that is not a code at
+    all (a name, a registry ID), which simply parses to nothing here.
+    """
+    claimed: dict[int, list[str]] = {}
+    for name in OIF_CODE_FIELDS:
+        raw = mode.get(name)
+        for item in raw if isinstance(raw, list) else [raw]:
+            code = hex_int(item)
+            if code is not None:
+                claimed.setdefault(code, []).append(f"{name} {item}")
+    return claimed
+
+
 def _match_oif(mode: dict[str, Any], doc: dict[str, Any]) -> list[Match]:
     """OIF is axis-factored: the 'record' is an application_code, not a row."""
     if not mentions(mode, STANDARD_KEYWORDS["OIF-400ZR"]):
         return []
 
-    codes = doc.get("axes", {}).get("application_code", [])
-    wanted = hex_int(mode.get("media_interface_id_hex"))
-    if wanted is None:
+    claimed = _claimed_codes(mode)
+    if not claimed:
         return []
 
     descriptions = doc.get("meta", {}).get("application_codes", {})
     matches = []
-    for code in codes:
-        if hex_int(code) != wanted:
+    for code in doc.get("axes", {}).get("application_code", []):
+        stated_by = claimed.get(hex_int(code))
+        if not stated_by:
             continue
         matches.append(
             Match(
@@ -279,7 +300,7 @@ def _match_oif(mode: dict[str, Any], doc: dict[str, Any]) -> list[Match]:
                 scope="application code",
                 label=f"{code} — {descriptions.get(code, '')}".strip(" —"),
                 record={"application_code": code},
-                evidence=[f"media_interface_id_hex {mode['media_interface_id_hex']} = application_code {code}"],
+                evidence=[f"{source} = application_code {code}" for source in stated_by],
                 corroborated=True,
             )
         )
@@ -412,6 +433,13 @@ def _alternatives(term: str) -> list[str]:
 
 def _oif_value(doc: dict, term: str, code: str) -> tuple[str | None, str | None]:
     for path in _alternatives(term):
+        if path.startswith("axes."):
+            values = doc.get("axes", {}).get(path.removeprefix("axes."))
+            if isinstance(values, list) and code in values:
+                return code, "axes"  # this axis is the selected record, not a property of it
+            if values is not None:
+                return _render(values), "axes"
+            continue
         if path.startswith("meta."):
             value = _walk(doc, path)
             if isinstance(value, dict) and code in value:

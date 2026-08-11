@@ -62,6 +62,14 @@ def mtime_of(runs_dir: str, run: str) -> float:
     return (Path(runs_dir) / run / MODES_FILE).stat().st_mtime
 
 
+def drop_empty_columns(frame: pd.DataFrame) -> pd.DataFrame:
+    """A column holding nothing but nulls, blanks or zeros says nothing about this mode."""
+    if frame.empty:
+        return frame
+    empty = frame.isna() | frame.isin(["", 0])
+    return frame.loc[:, ~empty.all()]
+
+
 def read_pick(selection: dict, standard: str, scope: str | None) -> standards.Match | None:
     """SFF-8024 holds one record per scope; every other standard holds a single record."""
     chosen = selection.get(standard)
@@ -239,36 +247,39 @@ with crosswalk_tab:
     if routable:
         st.subheader("Mapping detail")
         parameter = st.selectbox("Parameter", routable)
-        concept, role = index[parameter]
+        claims = index[parameter]
+        if len(claims) > 1:
+            st.caption(f"{len(claims)} concepts claim `{parameter}`; each route is shown below.")
 
-        st.markdown(f"**{concept.get('pref_label')}** — `{concept['canonical_id']}`")
-        if concept.get("definition"):
-            st.write(concept["definition"])
+        for concept, role in claims:
+            st.markdown(f"**{concept.get('pref_label')}** — `{concept['canonical_id']}`")
+            if concept.get("definition"):
+                st.write(concept["definition"])
 
-        facts = {
-            "dimension": concept.get("dimension"),
-            "SI unit": concept.get("si_unit"),
-            "quantity kind": concept.get("quantity_kind"),
-            "check type": concept.get("check_type"),
-            "reference point": concept.get("reference_point"),
-            "role of this parameter": role,
-            "acronyms": ", ".join(concept.get("acronyms", [])) or None,
-        }
-        known = {key: value for key, value in facts.items() if value is not None}
-        st.dataframe(
-            pd.DataFrame({"property": list(known), "value": [str(value) for value in known.values()]}),
-            width="stretch",
-            hide_index=True,
-        )
+            facts = {
+                "dimension": concept.get("dimension"),
+                "SI unit": concept.get("si_unit"),
+                "quantity kind": concept.get("quantity_kind"),
+                "check type": concept.get("check_type"),
+                "reference point": concept.get("reference_point"),
+                "role of this parameter": role,
+                "acronyms": ", ".join(concept.get("acronyms", [])) or None,
+            }
+            known = {key: value for key, value in facts.items() if value is not None}
+            st.dataframe(
+                pd.DataFrame({"property": list(known), "value": [str(value) for value in known.values()]}),
+                width="stretch",
+                hide_index=True,
+            )
 
-        details = crosswalk.mapping_details(concept)
-        if details.empty:
-            st.info("This concept is defined in the taxonomy but no standard term is mapped to it yet.")
-        else:
-            st.dataframe(details, width="stretch", hide_index=True)
+            details = crosswalk.mapping_details(concept)
+            if details.empty:
+                st.info("This concept is defined in the taxonomy but no standard term is mapped to it yet.")
+            else:
+                st.dataframe(details, width="stretch", hide_index=True)
 
-        if concept.get("notes"):
-            st.caption(f"Comparability note: {concept['notes']}")
+            if concept.get("notes"):
+                st.caption(f"Comparability note: {concept['notes']}")
 
     st.subheader("Reverse lookup")
     query = st.text_input(
@@ -382,20 +393,17 @@ with values_tab:
                     rows.append(
                         {
                             "standard": standard,
-                            "scope": scope or "—",
-                            "record": picked.label if picked else "—",
+                            "scope": scope,
+                            "record": picked.label if picked else None,
                             "confidence": picked.confidence if picked else "no record matched",
                             "candidates": len(options),
                             "rejected": len(candidates) - len(options),
-                            "why": " · ".join(picked.evidence) if picked else "",
+                            "why": " · ".join(picked.evidence) if picked else None,
                         }
                     )
 
             with resolution:
-                frame = pd.DataFrame(rows)
-                if not frame["rejected"].any():
-                    frame = frame.drop(columns="rejected")
-                st.dataframe(frame, width="stretch", hide_index=True)
+                st.dataframe(drop_empty_columns(pd.DataFrame(rows)), width="stretch", hide_index=True)
 
             wide, detail = standards.compare_mode(mode, taxonomy, docs, selected, chosen_standards)
             view = wide
@@ -438,10 +446,10 @@ with values_tab:
                             standard_frame.rename(columns={standard: "standard value"}).assign(standard=standard)
                         )
 
-                    download = pd.concat(tidy, ignore_index=True) if tidy else view
+                    download = pd.concat(tidy, ignore_index=True) if tidy else drop_empty_columns(view)
                 else:
-                    st.dataframe(view, width="stretch", hide_index=True)
-                    download = view
+                    download = drop_empty_columns(view)
+                    st.dataframe(download, width="stretch", hide_index=True)
 
                 st.download_button(
                     "Download values (CSV)",
@@ -452,7 +460,7 @@ with values_tab:
                 )
 
             with provenance_pane:
-                st.dataframe(detail, width="stretch", hide_index=True)
+                st.dataframe(drop_empty_columns(detail), width="stretch", hide_index=True)
                 st.caption(
                     "Values are read from each standard as published. Reference points, measurement "
                     "bandwidths and min/max orientation differ between standards, so treat the columns as "
